@@ -1,0 +1,95 @@
+---
+config:
+  flowchart:
+    htmlLabels: false
+---
+flowchart TD
+
+  %% =========================
+  %% Inputs (actual inputs only)
+  %% =========================
+  subgraph IN[Inputs]
+    direction TB
+    U[User self-report<br/>energy_now, constraints]
+    P[Preferences<br/>working blocks, budgets]
+    C[Calendar / integrations]
+  end
+
+  %% =========================
+  %% Planning Pipeline
+  %% =========================
+  subgraph PIPE[Planning pipeline]
+    direction TB
+
+    CTX[BUILD_CONTEXT]
+
+    CAD[COLLECT_CANDIDATE_TASKS<br/>join specs + load tags]
+
+    RT[RESOLVE_TAGS_AND_FILTERS<br/>normalize tag refs<br/>prepare tag_filter eval]
+
+    DF[DERIVE_FEATURES<br/>urgency<br/>remaining_minutes<br/>activation_cost<br/>is_potential_recovery]
+
+    MD[SELECT_MUST_DOS<br/>hard constraints]
+
+    SLOTS[BUILD_SLOTS<br/>availability<br/>buffers]
+
+    SCH[SCHEDULE<br/>IS_COMPATIBLE checks<br/>budgets<br/>dread threshold<br/>recovery insertion]
+
+    PLAN[GENERATE_PLAN_AND_EXPLANATIONS<br/>Markdown + rationale]
+  end
+
+  %% =========================
+  %% User-visible Outputs
+  %% =========================
+  subgraph OUTU[User outputs]
+    direction TB
+    UPLAN["Daily plan (Markdown)"]
+    URATIONALE[Explanations / rationale]
+    UNEXT[Next action prompt]
+  end
+
+  %% =========================
+  %% Internal Outputs (system artifacts)
+  %% =========================
+  subgraph OUTI[Internal outputs]
+    direction TB
+    EV[Events log<br/>append-only facts]
+    WL[Work logs / telemetry<br/>ratings, actuals]
+    CALI[Calibration data<br/>estimate accuracy]
+    PAT[Learned patterns<br/>recovery effects, activation]
+  end
+
+  %% =========================
+  %% Execution + Learning Loop
+  %% =========================
+  subgraph LOOP[Execution + learning]
+    direction TB
+    EXE[NEXT_ACTION<br/>execute / next action]
+    LEARN[LEARN_AND_CALIBRATE<br/>patterns<br/>estimate accuracy<br/>recovery effects]
+  end
+
+  %% Flow wiring (inputs)
+  U --> CTX
+  P --> CTX
+  C --> CTX
+
+  %% Pipeline flow
+  CTX --> CAD --> RT --> DF --> MD --> SLOTS --> SCH --> PLAN
+
+  %% User outputs from plan generation
+  PLAN --> UPLAN
+  PLAN --> URATIONALE
+  PLAN --> UNEXT
+
+  %% Internal outputs from plan generation + execution/learning
+  PLAN --> EV
+  EXE --> WL
+  LEARN --> PAT
+  LEARN --> CALI
+  EXE --> EV
+  LEARN --> EV
+
+  %% Loop wiring (plan -> execution -> learning)
+  UPLAN --> EXE
+  UNEXT --> EXE
+  EXE --> LEARN
