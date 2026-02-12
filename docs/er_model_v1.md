@@ -1,58 +1,119 @@
-# ER Model Draft (V1) — Updated for Task Specs, Recurrence, and Preferred Working Blocks
-*AI Life Management System — Canonical Data Layer*
+# ER Model Draft (V1) — Updated v2 (Entities + Typed Tags + Tag Filters)
+*AI Life Management System — Canonical Data Layer (State + Events)*
 
-This ER model is **state-first** (current truth) with an **append-only event log** for audit/replay. It supports:
-- Projects-first organization
-- **Recurring tasks via Task Specs**
-- Daily plans + scheduled blocks
-- Time/effort/enjoyment telemetry
-- Shared memory + preferences
-- Preferred working blocks by day/category
-- Future offloading engine (opportunities)
+This version incorporates your requested updates:
+- **Supertype `entities` table** for first-class objects
+- Typed tags with **valid target entity types**
+- Tags applied via a single **`applied_tags`** table referencing entities
+- Tag-filter JSONB for **preferred working blocks** and **time budgets**
+- Task split into **`task_specs` (definition + recurrence)** and **`tasks` (active instance)**
+- Dependencies defined at **TaskSpec** level with recurrence compatibility
+- `projects.personal_importance`
+- `task_specs.must_do_level` expanded to 0–4
+- Task “kind” treated as **derived** (view), not stored
 
 > Conventions: all IDs are `uuid`. Timestamps are `timestamptz`. Local times are stored as `time` and interpreted using `preferences.timezone`.
 
 ---
 
-## 1) Core entities (state)
+## Honest feedback (agree/disagree)
 
-### `users`
-Represents a single user in V1 (multi-tenant ready).
-- `id` (pk)
-- `email` (unique, nullable in dev mode)
-- `display_name`
-- `created_at`
+### ✅ I agree with
+- **Typed tags + tag filters** for scheduling/grouping/budgets: this is the right abstraction.
+- Making `tag_types`/`tags` first-class objects: correct.
+- `valid_target_entities` on `tag_types`: good, keeps tagging sane.
+- `time_budgets.tag_filter` matching working blocks: consistent and powerful.
+- `projects.personal_importance`: clear and user-centered.
+- `must_do_level` having a 0–4 ladder: good; matches your “hard minimums” constraint.
+- Deriving `one_off` vs `recurring` from recurrence fields: good; avoid extra state.
+
+### ⚠️ Where I’m slightly worried (but not blocking)
+Your **pure supertype `entities`** approach (removing `user_id/created_at` from all concrete tables) is clean, but it adds:
+- heavier joins in hot paths (planner queries)
+- more complex RLS if you ever want Hasura/RLS to be strong (joins in policies)
+
+This isn’t “wrong,” and since **all access goes through the API**, you can keep auth logic there for 1.0.  
+If performance/complexity becomes annoying, the safe evolution path is **denormalizing `user_id` on hot tables** with a check/trigger to keep it consistent with `entities`.
+
+### Clarifying questions
+None required to proceed. The spec below implements your requests as stated.
 
 ---
 
-### `projects`
-The primary organizing unit.
+## 0) Entity supertype
+
+### `entities`
+Tracks first-class objects of any concrete type.
+
 - `id` (pk)
 - `user_id` (fk → users.id, indexed)
+- `created_at` (timestamptz)
+- `type` (enum `entity_type`, indexed)
+
+**Notes**
+- Every first-class object row in a concrete table has a matching row in `entities`.
+- Concrete table `id` is both:
+  - PK of the concrete table
+  - FK to `entities.id`
+
+### `entity_type` (enum)
+Initial set (expand as needed):
+- `user`
+- `project`
+- `task_spec`
+- `task`
+- `task_spec_dependency`
+- `plan`
+- `plan_block`
+- `plan_item`
+- `note`
+- `commitment`
+- `preference`
+- `preferred_working_block`
+- `task_work_log`
+- `tag_type`
+- `tag`
+- `applied_tag`
+- `time_budget`
+- `offload_opportunity`
+
+---
+
+## 1) Users
+
+### `users`
+- `id` (pk)
+- `email` (unique, nullable in dev mode)
+- `display_name`
+
+> Ownership and creation time are read from `entities` where `entities.type='user'` and `entities.id = users.id`.
+
+---
+
+## 2) Projects
+
+### `projects`
+- `id` (pk, fk → entities.id where type=`project`)
 - `name`
 - `status` (enum: `active|paused|completed|archived`)
 - `goal` (text, nullable)
 - `notes_md` (text, nullable)
-- `created_at`, `updated_at`
-
-**Relationships**
-- Project 1 → many TaskSpecs
+- `personal_importance` (smallint 1–5, default 3)
+- `updated_at` (timestamptz)
 
 ---
 
-## 2) Tasks: split into `task_specs` and `tasks`
+## 3) Tasks (specs + instances)
 
 ### `task_specs`
-A durable specification of a task: what it is, how hard it is, and how/when it repeats.
-There is **at most one active `tasks` row** for a given `task_spec` at any time.
+Durable definition of a task, including recurrence.
 
-- `id` (pk)
-- `user_id` (fk → users.id, indexed)
-- `project_id` (fk → projects.id, nullable; allow “inbox” specs)
+- `id` (pk, fk → entities.id where type=`task_spec`)
+- `project_id` (fk → projects.id, nullable)
 - Content
   - `title`
   - `description_md` (text, nullable)
-- Planning / prioritization
+- Planning signals
   - `priority` (smallint, nullable)
   - `estimate_minutes` (int, nullable)
   - `estimate_confidence` (smallint 1–5, nullable)
@@ -61,108 +122,95 @@ There is **at most one active `tasks` row** for a given `task_spec` at any time.
   - `aversion` (smallint 1–5, nullable)
   - `delegatability` (smallint 1–5, nullable)
   - `automation_potential` (smallint 1–5, nullable)
-- Scheduling category (V1)
-  - `category` (enum: `work|personal`, default `work`)
-  - `allow_scheduling_outside_of_category` (bool, default false)
-- Recurrence (nullable = non-recurring)
+- Must-do level
+  - `must_do_level` (smallint 0–4, default 0)
+    - 0 optional
+    - 1 nice-to-have
+    - 2 should-have
+    - 3 really-should-do (personal must)
+    - 4 absolute-must (regulatory/critical)
+- Scheduling override
+  - `allow_out_of_band_scheduling` (bool, default false)
+- Recurrence (nullable = one-off)
   - `repeats_unit` (enum: `day|week|month|year`, nullable)
-  - `repeat_interval` (smallint, nullable)  
-    - e.g. `day + 1` = every day, `week + 2` = every other week
-  - `repeat_days` (text[], nullable)  
-    - Interpretation depends on `repeats_unit`:
-      - `week`: day tokens like `M, Tu, W, Th, F, Sa, Su`
-      - `month` / `year`: day-of-unit tokens as strings:
-        - integers like `"7"`, `"21"` (count from 1)
-        - `"last"` for last day of month/year
-      - `day`: must be null (it’s already daily interval)
-  - End conditions (mutually exclusive; both nullable = indefinite)
+  - `repeat_interval` (smallint, nullable)
+  - `repeat_days` (text[], nullable)
+    - if `week`: tokens {M,Tu,W,Th,F,Sa,Su}
+    - if `month`/`year`: numeric strings ("7","21") and/or "last"
+    - if `day`: must be null
+  - End conditions (mutually exclusive)
     - `repeat_end_date` (date, nullable)
     - `repeat_count` (int, nullable)
 - Lifecycle
   - `is_active` (bool, default true)
-  - `created_at`, `updated_at`
+  - `updated_at` (timestamptz)
 
-**Constraints**
-- If `repeats_unit` is not null, then `repeat_interval` is required.
-- `repeat_end_date` and `repeat_count` are mutually exclusive.
-- `repeat_days` rules:
-  - if `repeats_unit = 'week'` → tokens must be from {M,Tu,W,Th,F,Sa,Su}
-  - if `repeats_unit in ('month','year')` → tokens must be numeric strings (1..31/366 as appropriate), or 'last'
-  - if `repeats_unit = 'day'` → `repeat_days` must be null
-
-**Relationships**
-- TaskSpec 1 → (0..1) active Task
-- TaskSpec 1 → many Notes (optional)
-- TaskSpec 1 → many WorkLogs (via Task)
+**Derived “kind”**
+- Do **not** store `kind` in 1.0.
+- Provide a view:
+  - `kind = CASE WHEN repeats_unit IS NULL THEN 'one_off' ELSE 'recurring' END`
 
 ---
 
 ### `tasks`
-A concrete “instance” created from a TaskSpec. For non-recurring work, the TaskSpec may be one-off and produce exactly one Task.
-For recurring work: upon completion, the system generates the **next** Task instance.
+Concrete active instance created from a TaskSpec.
 
-- `id` (pk)
-- `user_id` (fk → users.id, indexed)
+- `id` (pk, fk → entities.id where type=`task`)
 - `task_spec_id` (fk → task_specs.id)
 - Instance lifecycle
   - `status` (enum: `todo|doing|blocked|done|canceled|archived`)
   - `due_at` (timestamptz, nullable)
   - `snoozed_until` (timestamptz, nullable)
 - Recurrence bookkeeping
-  - `occurrence_index` (int, nullable) — 1-based count for recurring series
-  - `occurrence_anchor_date` (date, nullable) — series anchor (optional)
-  - `occurrence_scheduled_for` (date, nullable) — intended recurrence date (optional)
-- `created_at`, `updated_at`
+  - `occurrence_index` (int, nullable) — 1-based
+  - `occurrence_anchor_date` (date, nullable)
+  - `occurrence_scheduled_for` (date, nullable)
+- `updated_at` (timestamptz)
 
-**Constraints**
+**Constraint**
 - At most one active Task per TaskSpec:
-  - Partial unique index on `(task_spec_id)` WHERE `status IN ('todo','doing','blocked')`
-- When marking a recurring task complete, API must:
-  - emit `TaskCompleted`
-  - compute next recurrence date
-  - create next Task with incremented `occurrence_index`
-  - emit `TaskRecurrenceCreated`
+  - partial unique index on `task_spec_id` WHERE `status IN ('todo','doing','blocked')`
+
+**Recurrence behavior**
+- When a recurring task completes, the API:
+  - computes next date
+  - creates next Task (new entity + row)
+  - emits events `TaskCompleted` + `TaskRecurrenceCreated`
 
 ---
 
 ### `task_spec_dependencies`
-Dependencies are defined at the TaskSpec level and only allowed when recurrence specs match.
-- `id` (pk)
-- `user_id` (fk → users.id)
-- `task_spec_id` (fk → task_specs.id) — the blocked spec
-- `depends_on_task_spec_id` (fk → task_specs.id) — prerequisite spec
+Dependencies live on TaskSpecs.
+
+- `id` (pk, fk → entities.id where type=`task_spec_dependency`)
+- `task_spec_id` (fk → task_specs.id)
+- `depends_on_task_spec_id` (fk → task_specs.id)
 - `type` (enum: `blocks|relates`, default `blocks`)
-- `created_at`
 
 **Constraints**
 - Unique `(task_spec_id, depends_on_task_spec_id, type)`
-- Prevent self-dependency.
-- **Recurrence compatibility constraint:** dependencies can only be created between TaskSpecs with the exact same recurrence specification:
-  - `repeats_unit`, `repeat_interval`, `repeat_days`, `repeat_end_date`, `repeat_count` must match
-  - For non-recurring tasks, all recurrence fields are null on both sides
-
-(Implementation note: enforce via API validation in V1; optionally via trigger in DB later.)
+- No self dependency.
+- **Recurrence compatibility:** only between TaskSpecs with identical recurrence spec
+  - Enforce in API in 1.0 (DB trigger later if desired)
 
 ---
 
-## 3) Planning
+## 4) Planning
 
 ### `plans`
-A daily plan (one per user per date recommended).
-- `id` (pk)
-- `user_id` (fk → users.id, indexed)
+- `id` (pk, fk → entities.id where type=`plan`)
 - `plan_date` (date, indexed)
 - `status` (enum: `draft|active|superseded|archived`)
 - `markdown` (text)
-- `created_at`, `updated_at`
+- `updated_at` (timestamptz)
 
----
+**Constraint**
+- One active plan per user per day:
+  - enforce via API in 1.0 (or a partial unique index using denormalized user_id, if added later)
 
 ### `plan_blocks`
-Scheduled time blocks within a plan.
-- `id` (pk)
-- `user_id` (fk → users.id)
-- `plan_id` (fk → plans.id, indexed)
+- `id` (pk, fk → entities.id where type=`plan_block`)
+- `plan_id` (fk → plans.id)
 - `title`
 - `start_at` (timestamptz)
 - `end_at` (timestamptz)
@@ -174,105 +222,127 @@ Scheduled time blocks within a plan.
   - `effort_rating` (smallint 1–5, nullable)
   - `enjoyment_rating` (smallint 1–5, nullable)
   - `activation_rating` (smallint 1–5, nullable)
-- `created_at`, `updated_at`
-
----
+- `updated_at` (timestamptz)
 
 ### `plan_items`
-Ordered inclusion of tasks (or outcomes) in a plan.
-- `id` (pk)
-- `user_id` (fk → users.id)
-- `plan_id` (fk → plans.id, indexed)
-- `task_id` (fk → tasks.id, nullable) — plan refers to concrete Task instances
-- `label` (text, nullable) — outcome text if task_id is null
+- `id` (pk, fk → entities.id where type=`plan_item`)
+- `plan_id` (fk → plans.id)
+- `task_id` (fk → tasks.id, nullable)
+- `label` (text, nullable)
 - `sort_order` (int)
 - `is_outcome` (bool, default false)
 - `rationale` (text, nullable)
-- `created_at`
 
 ---
 
-### `block_tasks` (optional)
-- `id` (pk)
-- `user_id` (fk → users.id)
-- `block_id` (fk → plan_blocks.id, indexed)
-- `task_id` (fk → tasks.id, indexed)
-- `sort_order` (int, nullable)
-
----
-
-## 4) Notes + commitments
+## 5) Notes + commitments
 
 ### `notes`
-- `id` (pk)
-- `user_id` (fk → users.id, indexed)
+- `id` (pk, fk → entities.id where type=`note`)
 - `project_id` (fk → projects.id, nullable)
 - `task_spec_id` (fk → task_specs.id, nullable)
 - `task_id` (fk → tasks.id, nullable)
 - `source` (enum: `cli|api|import|integration|manual`)
 - `title` (text, nullable)
 - `body_md` (text)
-- `created_at`, `updated_at`
-
----
+- `updated_at` (timestamptz)
 
 ### `commitments`
-- `id` (pk)
-- `user_id` (fk → users.id, indexed)
+- `id` (pk, fk → entities.id where type=`commitment`)
 - `counterparty` (text, nullable)
 - `description`
 - `due_at` (timestamptz, nullable)
 - `status` (enum: `open|satisfied|canceled`)
 - `source_note_id` (fk → notes.id, nullable)
-- `created_at`, `updated_at`
+- `updated_at` (timestamptz)
 
 ---
 
-## 5) Preferences + preferred working blocks
+## 6) Preferences + preferred working blocks
 
 ### `preferences`
-User-specified guardrails and defaults (highest priority).
-- `id` (pk)
-- `user_id` (fk → users.id, unique)
+- `id` (pk, fk → entities.id where type=`preference`)
 - `timezone` (text)
 - `max_focus_blocks_per_day` (smallint, nullable)
 - `default_buffer_minutes` (smallint, nullable)
 - `planning_style` (enum: `tell_me_what_to_do|collaborative|suggestions_only`)
 - `privacy_mode` (enum: `local_first|balanced|cloud_ok`)
-- `created_at`, `updated_at`
-
----
+- `updated_at` (timestamptz)
 
 ### `preferred_working_blocks`
-Defines preferred working windows by day-of-week and work category.
-- `id` (pk)
-- `user_id` (fk → users.id, indexed)
-- `days` (text[])  
-  - tokens: `M,Tu,W,Th,F,Sa,Su`
+- `id` (pk, fk → entities.id where type=`preferred_working_block`)
+- `days` (text[]) tokens: `M,Tu,W,Th,F,Sa,Su`
 - `time_start_local` (time)
 - `time_end_local` (time)
-- `task_categories` (text[])  
-  - V1 tokens: `work`, `personal`, `no_work`
-  - (future: `admin`, `deep_work`, `errands`, etc.)
-- `created_at`, `updated_at`
-
-**Constraints**
-- `time_end_local` > `time_start_local` (no overnight blocks in V1; can be extended later)
-
-**Usage**
-Planner uses these blocks as default scheduling boundaries:
-- Schedule tasks whose TaskSpec.category matches block categories
-- If `allow_scheduling_outside_of_category=true`, allow short exceptions (configurable heuristic)
+- `tag_filter` (jsonb)
+  - canonical shape (recommended):
+    - `any`: [<tag_ref>...]
+    - `all`: [<tag_ref>...]
+    - `none`: [<tag_ref>...]
+  - where `<tag_ref>` is either:
+    - `tag_id` (uuid as string), OR
+    - a canonical string like `"domain:work"` (resolved via tags table)
+- `updated_at` (timestamptz)
 
 ---
 
-## 6) Telemetry / work logs
+## 7) Typed tags
+
+### `tag_types`
+- `id` (pk, fk → entities.id where type=`tag_type`)
+- `name` (text, unique per user) — e.g. `domain`, `work_type`, `task_type`
+- `description` (text, nullable)
+- `is_system` (bool)
+- `valid_target_entities` (entity_type[])
+  - e.g. `['task_spec']` for task-only tag types
+  - or `['task_spec','project','note']` for shared vocabularies
+- `updated_at` (timestamptz)
+
+### `tags`
+- `id` (pk, fk → entities.id where type=`tag`)
+- `tag_type_id` (fk → tag_types.id)
+- `value` (text) — e.g. `work`, `deep_work`
+- `slug` (text) — normalized
+- `is_active` (bool, default true)
+- `updated_at` (timestamptz)
+
+**Constraint**
+- Unique `(tag_type_id, slug)`.
+
+### `applied_tags`
+Single join table that applies tags to any entity.
+
+- `id` (pk, fk → entities.id where type=`applied_tag`)
+- `tag_id` (fk → tags.id)
+- `target_entity_id` (fk → entities.id)
+- `applied_at` (timestamptz)
+
+**Constraints**
+- Unique `(tag_id, target_entity_id)` to prevent duplicates.
+- **Validation rule (API-enforced in 1.0):**
+  - `entities.type` of `target_entity_id` must be included in `tag_types.valid_target_entities` for the tag’s tag_type.
+  - (Optional later: DB trigger.)
+
+---
+
+## 8) Time budgets (time contribution commitments)
+
+### `time_budgets`
+- `id` (pk, fk → entities.id where type=`time_budget`)
+- `name` (text)
+- `period` (enum: `day|week|month`)
+- `target_minutes` (int)
+- `priority_weight` (numeric, nullable)
+- `tag_filter` (jsonb) — same shape as preferred blocks
+- `updated_at` (timestamptz)
+
+---
+
+## 9) Telemetry / work logs
 
 ### `task_work_logs`
-Captures actual work sessions (even outside planned blocks).
-- `id` (pk)
-- `user_id` (fk → users.id, indexed)
-- `task_id` (fk → tasks.id, indexed)
+- `id` (pk, fk → entities.id where type=`task_work_log`)
+- `task_id` (fk → tasks.id)
 - `block_id` (fk → plan_blocks.id, nullable)
 - `started_at` (timestamptz, nullable)
 - `ended_at` (timestamptz, nullable)
@@ -282,11 +352,10 @@ Captures actual work sessions (even outside planned blocks).
   - `enjoyment_rating` (smallint 1–5, nullable)
   - `activation_rating` (smallint 1–5, nullable)
 - `notes` (text, nullable)
-- `created_at`
 
 ---
 
-## 7) Append-only event log
+## 10) Append-only event log
 
 ### `events`
 Immutable fact record (insert-only).
@@ -305,9 +374,16 @@ Immutable fact record (insert-only).
 
 ---
 
-## 8) Relationship summary (high level)
-- **Project** has many **TaskSpecs**
-- **TaskSpec** has at most one active **Task**
-- **PlanItems** reference **Tasks** (instances)
-- Dependencies are between **TaskSpecs**, and only for matching recurrence specs
-- **PreferredWorkingBlocks** guide planner scheduling by category
+## 11) Key 1.0 implementation notes
+- API owns all writes; create `entities` row + concrete row in a **single transaction**.
+- Consider later denormalization of `user_id` on hot tables if planner queries need it.
+- Normalize and version `tag_filter` JSONB to keep semantics stable (e.g., `filter_version`).
+
+---
+
+## 12) Relationship summary
+- `entities` is the supertype for all first-class objects.
+- `projects` have many `task_specs`.
+- `task_specs` produce at most one active `tasks` instance.
+- `applied_tags` attaches `tags` to any `entities` row, validated by `tag_types.valid_target_entities`.
+- `preferred_working_blocks.tag_filter` and `time_budgets.tag_filter` select tasks by tags (typically targeting TaskSpecs).
