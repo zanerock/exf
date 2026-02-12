@@ -1,127 +1,89 @@
-# Planning Flow & Computational Framework (V1)
-*Updated for Entities, Typed Tags, Tag Filters, and Time Budgets*
+# Planning Flow & Computational Framework (V1) — Updated for Potential Recovery + Partial Completion
+*Tags, Tag Filters, Time Budgets, Activation Cost, Dread Load, and Progress-Aware Scheduling*
 
-This document describes **how plans are computed**, step by step, using the current ER model:
-- Entity supertype (`entities`)
-- TaskSpecs + Tasks split
-- Typed tags applied via `applied_tags`
-- Tag-filter–based preferred working blocks
-- Tag-filter–based time budgets
-- Activation energy as a **derived, contextual cost**
-
-This is a **working model**, not a fixed algorithm. The goal is correctness, explainability, and evolvability.
+This is an updated version of **planning_flow.md**. It adds:
+- A user tag `effect:potential_recovery` used to insert “refill the tank” activities
+- A planner rule: potential recovery tasks are allowed in **any** work block (out-of-band)
+- Progress-aware scheduling via `tasks.completion_percent` (remaining minutes)
 
 ---
 
-## Core principles
+## 1) New concepts
 
-1. **Hard constraints first**
-   - Regulatory / absolute must-dos
-   - Due dates
-   - Dependencies
-   - Available time windows
+### 1.1 Potential recovery (tag-driven)
+Some tasks can *reduce perceived load* or *increase follow-through*.
+This is **user-specified** via tag:
 
-2. **Then optimize for follow-through**
-   - Minimize activation friction
-   - Avoid dread overload
-   - Match work to energy and time-of-day
-   - Protect meaningful progress (projects the user cares about)
+- `effect:potential_recovery`
 
-3. **Tags drive grouping and filtering**
-   - Tags decorate TaskSpecs
-   - Working blocks and time budgets select tasks via tag filters
-   - Minimal scalar fields exist only for invariants
+It is intentionally named “potential” because:
+- the effect is context-dependent
+- the system should learn actual impact over time from telemetry
 
----
+**Planner rule**
+- If a task has `effect:potential_recovery`, it may be scheduled in any block
+  (even when the block’s tag filter would otherwise exclude it).
 
-## Key concepts
-
-### TaskSpec vs Task
-- **TaskSpec** = what the task *is* (definition, recurrence, difficulty, tags)
-- **Task** = the single active instance right now
-- For recurring work:
-  - completing a Task generates the next Task
-  - there is at most one active Task per TaskSpec
-
-### Activation energy (derived)
-Activation energy is **not stored**. It is computed from:
-- TaskSpec fields (`energy_level`, `aversion`)
-- Learned telemetry (work logs, ratings)
-- User’s current self-reported state
-- Context (time of day, switching cost)
+**Recommended data invariant**
+- Applying `effect:potential_recovery` implies:
+  - `task_specs.allow_out_of_band_scheduling = true`
 
 ---
 
-## Inputs to planning
+### 1.2 Partial completion
+A task can be partially complete while still active.
 
-### User self-report (ephemeral)
-Collected at plan time and/or throughout the day:
-- `energy_now` (1–5)
-- `mood_now` (optional)
-- `focus_now` (optional)
-- `capacity_override_minutes` (optional)
-- `planning_constraints` (e.g. “no hard things today”)
+- `tasks.completion_percent` (0–100)
 
-### Persistent state
-- Active `tasks` + their `task_specs`
-- Applied tags on TaskSpecs
-- Preferred working blocks (with `tag_filter`)
-- Time budgets (with `tag_filter`)
-- Calendar events (if integrated)
-- Historical telemetry (`task_work_logs`)
+**Remaining time**
+- `remaining_minutes = ceil(calibrated_estimate * (1 - completion_percent/100.0))`
+
+The planner schedules **remaining minutes**, not the original estimate.
 
 ---
 
-## Canonical tag filter shape
+## 2) Planner resources tracked during scheduling
 
-Used by:
-- `preferred_working_blocks.tag_filter`
-- `time_budgets.tag_filter`
+In addition to time, the planner tracks two running “loads”:
 
-```json
-{
-  "any":  ["domain:work", "work_type:admin"],
-  "all":  ["project:health"],
-  "none": ["work_type:meeting"]
-}
-```
+### 2.1 Dread load
+A running value that increases when scheduling high-aversion / high-activation tasks.
+It is used to prevent stacking hard tasks on low-energy days.
 
-Interpretation:
-- `any`: at least one must match
-- `all`: all must match
-- `none`: none may match
+### 2.2 Recovery credit
+A running value that decreases dread load when a recovery task is scheduled.
 
-Tags are resolved to tag IDs before evaluation.
+> Importantly: we do NOT treat recovery as “negative activation cost” in the objective function,
+> because that can cause pathological schedules (“all breaks”). Instead, recovery is a *separate mechanism*
+> with caps and placement rules.
 
 ---
 
-## High-level planning flow
+## 3) Updated flow (high level)
 
 ```text
 BUILD CONTEXT
   ↓
 COLLECT CANDIDATE TASKS
   ↓
-DERIVE FEATURES (urgency, activation cost, fit)
+RESOLVE TAGS + FILTERS
   ↓
-SELECT MUST-DOS (hard constraints)
+DERIVE FEATURES (urgency, remaining_minutes, activation_cost)
   ↓
-ALLOCATE TIME BUDGETS (soft constraints)
+SELECT MUST-DOS
   ↓
-SELECT OUTCOMES (meaningful progress)
+BUILD SLOTS (from preferred blocks + calendar)
   ↓
-BUILD TIME SLOTS
-  ↓
-SCHEDULE TASKS INTO SLOTS
+SCHEDULE WITH DREAD/RECOVERY CONTROL + BUDGETS
   ↓
 GENERATE PLAN + EXPLANATIONS
 ```
 
 ---
 
-## Pseudocode
+## 4) Pseudocode (updated)
 
-### Build context
+### 4.1 Build context
 
 ```pseudo
 function BUILD_CONTEXT(date, user_id, user_state):
@@ -130,267 +92,187 @@ function BUILD_CONTEXT(date, user_id, user_state):
     budgets = load_time_budgets(user_id)
     calendar = load_calendar_events(user_id, date)
 
-    availability = compute_availability(
-        working_blocks,
-        calendar,
-        prefs.default_buffer_minutes
-    )
+    availability = compute_availability(working_blocks, calendar, prefs.default_buffer_minutes)
 
     patterns = load_learned_patterns(user_id)
     calibration = load_time_calibration(user_id)
 
-    return {
-        date,
-        user_id,
-        prefs,
-        user_state,
-        availability,
-        working_blocks,
-        budgets,
-        patterns,
-        calibration
-    }
+    return {date, user_id, prefs, user_state, availability, working_blocks, budgets, patterns, calibration}
 ```
 
 ---
 
-### Collect candidate tasks
+### 4.2 Candidate tasks
 
 ```pseudo
 function COLLECT_CANDIDATE_TASKS(ctx):
     tasks = query Tasks
         where status in ('todo','doing','blocked')
-        and snoozed_until is null or snoozed_until <= now
+        and (snoozed_until is null or snoozed_until <= now)
 
-    specs = join task_specs on tasks.task_spec_id
+    # join specs + tags
+    for task in tasks:
+        task.spec = load_task_spec(task.task_spec_id)
+        task.tags = load_tags_for_entity(task.spec.id)
 
-    # Dependency filtering
-    tasks = filter tasks where all blocking dependencies are satisfied
+    tasks = filter tasks where dependencies_satisfied(task)
 
     return tasks
 ```
 
 ---
 
-### Derive task features
+### 4.3 Feature derivation (updated)
 
 ```pseudo
 function DERIVE_FEATURES(task, ctx):
-    spec = task.task_spec
-    tags = load_tags_for_entity(spec.id)
+    spec = task.spec
 
     urgency = compute_urgency(task.due_at, ctx.date)
 
-    est = calibrated_estimate(
-        spec.estimate_minutes,
-        spec,
-        ctx.calibration
-    )
+    est = calibrated_estimate(spec.estimate_minutes, spec, ctx.calibration)
 
-    activation_base =
-        2 * (spec.aversion or 3) +
-        1 * (spec.energy_level or 3)
+    remaining_minutes = ceil(est * (1 - task.completion_percent/100.0))
 
-    learned_adj = ctx.patterns.activation_adjustment(spec)
-    activation_base += learned_adj
+    activation_base = 2*(spec.aversion or 3) + 1*(spec.energy_level or 3)
 
-    energy_penalty =
-        max(0, (spec.energy_level or 3) - ctx.user_state.energy_now)
+    energy_penalty = max(0, (spec.energy_level or 3) - (ctx.user_state.energy_now or 3))
 
-    activation_cost =
-        activation_base * (1 + 0.25 * energy_penalty)
+    activation_cost = activation_base * (1 + 0.25*energy_penalty)
 
-    return {
-        urgency,
-        est,
-        activation_cost,
-        tags,
-        must_do_level: spec.must_do_level
-    }
+    is_potential_recovery = task.tags contains "effect:potential_recovery"
+
+    return {urgency, remaining_minutes, activation_cost, is_potential_recovery, must_do_level: spec.must_do_level}
 ```
 
 ---
 
-### Select must-dos
+### 4.4 Slot compatibility (updated for recovery)
 
 ```pseudo
-function SELECT_MUST_DOS(tasks):
-    return tasks where
-        task.must_do_level == 4
-        or task.is_overdue
-```
+function IS_COMPATIBLE(task, slot):
+    if task.is_potential_recovery:
+        return true  # recovery tasks are allowed anywhere
 
-Rules:
-- Must-dos are *forced* into the plan.
-- If must-dos exceed capacity, the system:
-  - emits a conflict event
-  - produces a triage/salvage plan
+    if task.spec.allow_out_of_band_scheduling:
+        return true  # explicit override
 
----
-
-### Allocate time budgets (soft constraints)
-
-```pseudo
-function INIT_BUDGET_TRACKING(ctx):
-    for budget in ctx.budgets:
-        budget.remaining_minutes = budget.target_minutes
-```
-
-During scheduling:
-- Tasks matching a budget’s `tag_filter` consume from that budget.
-- Budgets influence selection priority, not hard blocking (in 1.0).
-
----
-
-### Select outcomes (meaningful progress)
-
-```pseudo
-function SELECT_OUTCOMES(tasks, ctx):
-    grouped = group tasks by project
-
-    outcomes = []
-
-    # Always include at most one must-do outcome
-    if any must-dos:
-        outcomes.add(outcome_from(must-dos))
-
-    candidates = sort remaining tasks by
-        (project.personal_importance,
-         task.priority,
-         -task.activation_cost)
-
-    while outcomes < MAX_OUTCOMES:
-        next = pick_diverse_project(candidates, outcomes)
-        if next is null: break
-        outcomes.add(outcome_from(next))
-
-    return outcomes
+    return matches_tag_filter(task.tags, slot.tag_filter)
 ```
 
 ---
 
-### Build time slots
+### 4.5 Scheduling with dread + recovery control
 
-```pseudo
-function BUILD_SLOTS(ctx):
-    slots = []
-
-    for window in ctx.availability:
-        slots += split_into_blocks(window, ctx.prefs)
-
-    slots = insert_buffers(slots, ctx.prefs)
-
-    return slots
-```
-
----
-
-### Schedule tasks into slots
+Key parameters (heuristics; tune later):
+- `DREAD_THRESHOLD` depends on energy_now
+- `RECOVERY_MAX_PER_DAY` (e.g. 2–4)
+- `RECOVERY_MIN_GAP_MINUTES` (avoid too many breaks)
 
 ```pseudo
 function SCHEDULE(slots, tasks, ctx):
-    dread_budget = compute_dread_budget(ctx.user_state.energy_now)
+    must_dos = SELECT_MUST_DOS(tasks)
+
+    dread_threshold = compute_dread_threshold(ctx.user_state.energy_now)
+    dread_load = 0
+    recovery_used = 0
 
     plan = empty_plan()
 
-    # 1. Place must-dos
-    for task in must_dos sorted by urgency:
-        slot = find_compatible_slot(task, slots, ctx)
-        assign(plan, slot, task)
+    # helper: choose next recovery task
+    function PICK_RECOVERY_TASK(tasks):
+        candidates = tasks where is_potential_recovery
+        return best candidate by (low activation_cost, short remaining_minutes, high learned_enjoyment)
 
-    # 2. Allocate outcome work
-    for outcome in outcomes:
-        for task in outcome.tasks:
-            if dread_budget_exceeded(task): continue
-            slot = find_compatible_slot(task, slots, ctx)
-            assign(plan, slot, task)
-            update_budgets(task)
+    # 1) Place must-dos (hard constraints)
+    for t in must_dos sorted by urgency desc:
+        slot = find_best_slot(slots, t)
+        assign(plan, slot, t)
+        dread_load += t.activation_cost
+        consume_time_budgets(t, ctx)
 
-    # 3. Fill remaining slots
-    remaining = sort tasks by
-        (task.score / task.est) desc
+        # After a very hard must-do chunk, insert recovery if possible
+        if dread_load >= dread_threshold and recovery_used < RECOVERY_MAX_PER_DAY:
+            r = PICK_RECOVERY_TASK(tasks not yet scheduled)
+            if r exists:
+                rslot = find_nearest_free_slot(slots, duration=r.remaining_minutes)
+                assign(plan, rslot, r)
+                dread_load = max(0, dread_load - RECOVERY_CREDIT(r, ctx))
+                recovery_used += 1
+
+    # 2) Schedule outcomes + budget-aware work
+    remaining = tasks not yet scheduled
+    remaining = sort remaining by (score_per_minute desc)
 
     for slot in free slots:
-        task = first compatible remaining task
-        if task exists:
-            assign(plan, slot, task)
+        # if we're above dread threshold, try recovery first
+        if dread_load >= dread_threshold and recovery_used < RECOVERY_MAX_PER_DAY:
+            r = PICK_RECOVERY_TASK(remaining)
+            if r exists and r.remaining_minutes <= slot.duration:
+                assign(plan, slot, r)
+                dread_load = max(0, dread_load - RECOVERY_CREDIT(r, ctx))
+                recovery_used += 1
+                continue
+
+        # otherwise schedule best compatible task
+        t = first task in remaining where IS_COMPATIBLE(task=t, slot=slot) and t.remaining_minutes <= slot.duration
+        if t exists:
+            assign(plan, slot, t)
+            dread_load += t.activation_cost
+            consume_time_budgets(t, ctx)
+
+    plan = enforce_calmness(plan, ctx)  # buffers, switching reduction, realism
 
     return plan
 ```
 
-Compatibility checks include:
-- Slot time ≥ estimated duration
-- Slot `tag_filter` matches task’s tags
-- Task allows out-of-band scheduling OR matches block intent
+**Notes**
+- `RECOVERY_CREDIT(r, ctx)` can start as a fixed value (e.g. 6–10) and later become learned from work logs.
+- Because recovery tasks are “allowed anywhere,” they can be used as micro-breaks inside work blocks without breaking tag constraints.
 
 ---
 
-### Generate explanations (critical)
+## 5) Explanations (updated)
 
-For every scheduled task or exclusion, store:
+Every time the planner inserts a recovery task, include:
+- what threshold was exceeded
+- why this task was selected
+- how it supports finishing the hard items
 
+Example explanation payload:
 ```json
 {
-  "why_now": "...",
-  "why_not_later": "...",
-  "constraints_satisfied": [...],
-  "tradeoffs": [...]
+  "decision": "InsertRecovery",
+  "trigger": {"dread_load": 18.0, "threshold": 16.0},
+  "selected_task": "Walk 10 minutes",
+  "reason": "Marked potential recovery; short; historically increases follow-through",
+  "expected_effect": "Reduce dread load and improve completion probability"
 }
 ```
 
-These explanations:
-- are written into plan markdown
-- are emitted as events
-- power trust and user correction
+---
+
+## 6) ER model impacts (what changed)
+- `tasks.completion_percent` enables progress-aware scheduling
+- Tag type `effect` + tag `potential_recovery` enables recovery insertion and out-of-band eligibility
+- `allow_out_of_band_scheduling` remains as a general override; recovery implies it
 
 ---
 
-## Execution-time “What should I do now?”
+## 7) Why this approach avoids “break spam”
+We intentionally **do not** treat recovery as negative activation cost in the objective.
+Instead:
+- recovery is inserted only when the dread load exceeds a threshold
+- recovery has a daily cap
+- recovery must fit available time windows
+- recovery tasks are still subject to duration realism
 
-```pseudo
-function NEXT_ACTION(now, ctx):
-    current_block = find_current_block(now)
-
-    if current_block has task:
-        return next_step(current_block.task)
-
-    candidates = COLLECT_CANDIDATE_TASKS(ctx)
-
-    best = argmax candidates by
-        value - activation_cost
-
-    return {
-        do: smallest_viable_step(best),
-        reason: explanation(best),
-        escape_hatches: [
-            lower_activation_alternative,
-            5_min_starter
-        ]
-    }
-```
+This yields: “2 dreaded emails → recovery → 2 dreaded emails,” without producing “all day walking.”
 
 ---
 
-## Key invariants
-
-- Every planning decision emits events.
-- Activation energy is **derived**, not stored.
-- Tags are the primary grouping/filtering mechanism.
-- Hard must-dos always win.
-- The plan must remain *calm* and *realistic*.
-
----
-
-## What this framework supports later (by design)
-
-- Multi-day planning
-- Dynamic replanning mid-day
-- Automated offloading suggestions
-- Learning-based activation prediction
-- User-specific planning styles
-- Multiple agent planners (all consuming the same state/events)
-
----
-
-**This is the computational heart of the system.**
-If this feels right, the next step is locking the **1.0 Postgres DDL + indexes** that make this efficient.
+If this looks right, the next stress test should be a day with:
+- multiple high-aversion admin items
+- several potential recovery options
+- and tight time budgets
+to confirm the recovery insertion behaves sensibly.
