@@ -1,14 +1,16 @@
-# ER Model Draft (V1)
+# ER Model Draft (V1) — Updated for Task Specs, Recurrence, and Preferred Working Blocks
 *AI Life Management System — Canonical Data Layer*
 
 This ER model is **state-first** (current truth) with an **append-only event log** for audit/replay. It supports:
 - Projects-first organization
+- **Recurring tasks via Task Specs**
 - Daily plans + scheduled blocks
 - Time/effort/enjoyment telemetry
 - Shared memory + preferences
+- Preferred working blocks by day/category
 - Future offloading engine (opportunities)
 
-> Conventions: all IDs are `uuid`. Timestamps are `timestamptz`. `user_id` is required on all user-owned entities.
+> Conventions: all IDs are `uuid`. Timestamps are `timestamptz`. Local times are stored as `time` and interpreted using `preferences.timezone`.
 
 ---
 
@@ -21,9 +23,6 @@ Represents a single user in V1 (multi-tenant ready).
 - `display_name`
 - `created_at`
 
-**Relationships**
-- 1 → many across almost all tables.
-
 ---
 
 ### `projects`
@@ -33,60 +32,120 @@ The primary organizing unit.
 - `name`
 - `status` (enum: `active|paused|completed|archived`)
 - `goal` (text, nullable)
-- `notes_md` (text, nullable) — lightweight project context in V1
+- `notes_md` (text, nullable)
 - `created_at`, `updated_at`
 
 **Relationships**
-- Project 1 → many Tasks
-- Project 1 → many Notes (optional)
-- Project 1 → many OffloadOpportunities (via source tasks)
+- Project 1 → many TaskSpecs
 
 ---
 
-### `tasks`
-Canonical task definition (may recur via separate mechanism later).
+## 2) Tasks: split into `task_specs` and `tasks`
+
+### `task_specs`
+A durable specification of a task: what it is, how hard it is, and how/when it repeats.
+There is **at most one active `tasks` row** for a given `task_spec` at any time.
+
 - `id` (pk)
 - `user_id` (fk → users.id, indexed)
-- `project_id` (fk → projects.id, nullable; allow “inbox” tasks)
-- `title`
-- `description_md` (text, nullable)
-- `status` (enum: `inbox|todo|doing|blocked|done|canceled|archived`)
-- `priority` (smallint, nullable) — user/system ranking
-- `due_at` (timestamptz, nullable)
-- `snoozed_until` (timestamptz, nullable)
-- Estimation (stateful “current best guess”):
+- `project_id` (fk → projects.id, nullable; allow “inbox” specs)
+- Content
+  - `title`
+  - `description_md` (text, nullable)
+- Planning / prioritization
+  - `priority` (smallint, nullable)
   - `estimate_minutes` (int, nullable)
   - `estimate_confidence` (smallint 1–5, nullable)
   - `estimate_source` (enum: `user|system|model`, nullable)
-- Work-shaping signals (for planning/offloading):
   - `energy_level` (smallint 1–5, nullable)
   - `aversion` (smallint 1–5, nullable)
   - `delegatability` (smallint 1–5, nullable)
   - `automation_potential` (smallint 1–5, nullable)
-- `created_at`, `updated_at`
+- Scheduling category (V1)
+  - `category` (enum: `work|personal`, default `work`)
+  - `allow_scheduling_outside_of_category` (bool, default false)
+- Recurrence (nullable = non-recurring)
+  - `repeats_unit` (enum: `day|week|month|year`, nullable)
+  - `repeat_interval` (smallint, nullable)  
+    - e.g. `day + 1` = every day, `week + 2` = every other week
+  - `repeat_days` (text[], nullable)  
+    - Interpretation depends on `repeats_unit`:
+      - `week`: day tokens like `M, Tu, W, Th, F, Sa, Su`
+      - `month` / `year`: day-of-unit tokens as strings:
+        - integers like `"7"`, `"21"` (count from 1)
+        - `"last"` for last day of month/year
+      - `day`: must be null (it’s already daily interval)
+  - End conditions (mutually exclusive; both nullable = indefinite)
+    - `repeat_end_date` (date, nullable)
+    - `repeat_count` (int, nullable)
+- Lifecycle
+  - `is_active` (bool, default true)
+  - `created_at`, `updated_at`
+
+**Constraints**
+- If `repeats_unit` is not null, then `repeat_interval` is required.
+- `repeat_end_date` and `repeat_count` are mutually exclusive.
+- `repeat_days` rules:
+  - if `repeats_unit = 'week'` → tokens must be from {M,Tu,W,Th,F,Sa,Su}
+  - if `repeats_unit in ('month','year')` → tokens must be numeric strings (1..31/366 as appropriate), or 'last'
+  - if `repeats_unit = 'day'` → `repeat_days` must be null
 
 **Relationships**
-- Task 1 → many TaskDependencies (as parent or child)
-- Task 1 → many Notes (optional)
-- Task 1 → many PlanItems (optional inclusion in plans)
-- Task 1 → many TaskWorkLogs (actuals + ratings)
+- TaskSpec 1 → (0..1) active Task
+- TaskSpec 1 → many Notes (optional)
+- TaskSpec 1 → many WorkLogs (via Task)
 
 ---
 
-### `task_dependencies`
-Directed edges between tasks.
+### `tasks`
+A concrete “instance” created from a TaskSpec. For non-recurring work, the TaskSpec may be one-off and produce exactly one Task.
+For recurring work: upon completion, the system generates the **next** Task instance.
+
+- `id` (pk)
+- `user_id` (fk → users.id, indexed)
+- `task_spec_id` (fk → task_specs.id)
+- Instance lifecycle
+  - `status` (enum: `todo|doing|blocked|done|canceled|archived`)
+  - `due_at` (timestamptz, nullable)
+  - `snoozed_until` (timestamptz, nullable)
+- Recurrence bookkeeping
+  - `occurrence_index` (int, nullable) — 1-based count for recurring series
+  - `occurrence_anchor_date` (date, nullable) — series anchor (optional)
+  - `occurrence_scheduled_for` (date, nullable) — intended recurrence date (optional)
+- `created_at`, `updated_at`
+
+**Constraints**
+- At most one active Task per TaskSpec:
+  - Partial unique index on `(task_spec_id)` WHERE `status IN ('todo','doing','blocked')`
+- When marking a recurring task complete, API must:
+  - emit `TaskCompleted`
+  - compute next recurrence date
+  - create next Task with incremented `occurrence_index`
+  - emit `TaskRecurrenceCreated`
+
+---
+
+### `task_spec_dependencies`
+Dependencies are defined at the TaskSpec level and only allowed when recurrence specs match.
 - `id` (pk)
 - `user_id` (fk → users.id)
-- `task_id` (fk → tasks.id) — the blocked task
-- `depends_on_task_id` (fk → tasks.id) — prerequisite
+- `task_spec_id` (fk → task_specs.id) — the blocked spec
+- `depends_on_task_spec_id` (fk → task_specs.id) — prerequisite spec
 - `type` (enum: `blocks|relates`, default `blocks`)
 - `created_at`
 
 **Constraints**
-- Unique `(task_id, depends_on_task_id, type)`
+- Unique `(task_spec_id, depends_on_task_spec_id, type)`
 - Prevent self-dependency.
+- **Recurrence compatibility constraint:** dependencies can only be created between TaskSpecs with the exact same recurrence specification:
+  - `repeats_unit`, `repeat_interval`, `repeat_days`, `repeat_end_date`, `repeat_count` must match
+  - For non-recurring tasks, all recurrence fields are null on both sides
+
+(Implementation note: enforce via API validation in V1; optionally via trigger in DB later.)
 
 ---
+
+## 3) Planning
 
 ### `plans`
 A daily plan (one per user per date recommended).
@@ -94,15 +153,8 @@ A daily plan (one per user per date recommended).
 - `user_id` (fk → users.id, indexed)
 - `plan_date` (date, indexed)
 - `status` (enum: `draft|active|superseded|archived`)
-- `markdown` (text) — rendered daily plan doc
+- `markdown` (text)
 - `created_at`, `updated_at`
-
-**Constraints**
-- Unique `(user_id, plan_date, status='active')` (enforced via partial unique index)
-
-**Relationships**
-- Plan 1 → many PlanBlocks
-- Plan 1 → many PlanItems (task inclusion + ordering)
 
 ---
 
@@ -115,20 +167,14 @@ Scheduled time blocks within a plan.
 - `start_at` (timestamptz)
 - `end_at` (timestamptz)
 - `block_type` (enum: `focus|admin|meeting|buffer|break|errand|open`)
-- `intent` (text, nullable) — “why this block exists”
+- `intent` (text, nullable)
 - `status` (enum: `planned|in_progress|completed|skipped|canceled`)
-- Estimates + actuals:
-  - `estimate_minutes` (int, nullable) — usually derived from start/end
-  - `actual_minutes` (int, nullable)
-- Ratings (telemetry to power future recommendations):
+- `actual_minutes` (int, nullable)
+- Ratings:
   - `effort_rating` (smallint 1–5, nullable)
   - `enjoyment_rating` (smallint 1–5, nullable)
   - `activation_rating` (smallint 1–5, nullable)
 - `created_at`, `updated_at`
-
-**Relationships**
-- Block many ↔ many Tasks via BlockTasks (optional granularity)
-- Block 1 → many TaskWorkLogs (or you can treat Block as the work log)
 
 ---
 
@@ -137,36 +183,31 @@ Ordered inclusion of tasks (or outcomes) in a plan.
 - `id` (pk)
 - `user_id` (fk → users.id)
 - `plan_id` (fk → plans.id, indexed)
-- `task_id` (fk → tasks.id, nullable) — allow non-task “outcome” items
+- `task_id` (fk → tasks.id, nullable) — plan refers to concrete Task instances
 - `label` (text, nullable) — outcome text if task_id is null
 - `sort_order` (int)
 - `is_outcome` (bool, default false)
-- `rationale` (text, nullable) — “why it’s in today”
+- `rationale` (text, nullable)
 - `created_at`
-
-**Constraints**
-- Unique `(plan_id, sort_order)`
 
 ---
 
-### `block_tasks` (optional but useful)
-If you want to tie specific tasks to a scheduled block.
+### `block_tasks` (optional)
 - `id` (pk)
 - `user_id` (fk → users.id)
 - `block_id` (fk → plan_blocks.id, indexed)
 - `task_id` (fk → tasks.id, indexed)
 - `sort_order` (int, nullable)
 
-**Constraints**
-- Unique `(block_id, task_id)`
-
 ---
 
+## 4) Notes + commitments
+
 ### `notes`
-General notes (capture, project notes, meeting notes).
 - `id` (pk)
 - `user_id` (fk → users.id, indexed)
 - `project_id` (fk → projects.id, nullable)
+- `task_spec_id` (fk → task_specs.id, nullable)
 - `task_id` (fk → tasks.id, nullable)
 - `source` (enum: `cli|api|import|integration|manual`)
 - `title` (text, nullable)
@@ -176,7 +217,6 @@ General notes (capture, project notes, meeting notes).
 ---
 
 ### `commitments`
-Tracks promises/obligations explicitly (helps “don’t lose threads”).
 - `id` (pk)
 - `user_id` (fk → users.id, indexed)
 - `counterparty` (text, nullable)
@@ -188,13 +228,13 @@ Tracks promises/obligations explicitly (helps “don’t lose threads”).
 
 ---
 
+## 5) Preferences + preferred working blocks
+
 ### `preferences`
-User-specified guardrails and defaults (high priority).
+User-specified guardrails and defaults (highest priority).
 - `id` (pk)
 - `user_id` (fk → users.id, unique)
 - `timezone` (text)
-- `workday_start_local` (time, nullable)
-- `workday_end_local` (time, nullable)
 - `max_focus_blocks_per_day` (smallint, nullable)
 - `default_buffer_minutes` (smallint, nullable)
 - `planning_style` (enum: `tell_me_what_to_do|collaborative|suggestions_only`)
@@ -203,74 +243,30 @@ User-specified guardrails and defaults (high priority).
 
 ---
 
-### `capabilities`
-Registry of system “capabilities” (planner, summarizer, etc.) for routing + governance.
-- `id` (pk)
-- `name` (unique) — e.g. `plan_generate`, `next_action`
-- `description` (text, nullable)
-
----
-
-### `ai_providers`
-Configured providers/models (global or per-user).
-- `id` (pk)
-- `user_id` (fk → users.id, nullable for global)
-- `provider` (text) — `openai|anthropic|local|custom`
-- `model` (text)
-- `endpoint` (text, nullable)
-- `is_enabled` (bool)
-- `created_at`, `updated_at`
-
----
-
-### `ai_routing_rules`
-Routing rules for AI gateway policy (configurable; can start as a single default rule).
-- `id` (pk)
-- `user_id` (fk → users.id, nullable for global)
-- `capability_id` (fk → capabilities.id, nullable)
-- `sensitivity` (enum: `low|medium|high`, nullable)
-- `preferred_provider_id` (fk → ai_providers.id)
-- `priority` (int) — higher wins
-- `created_at`, `updated_at`
-
----
-
-### `ai_requests` (audit-friendly state table; complements events)
-Stores metadata per model call; payload bodies can live in events to avoid duplication.
+### `preferred_working_blocks`
+Defines preferred working windows by day-of-week and work category.
 - `id` (pk)
 - `user_id` (fk → users.id, indexed)
-- `capability_id` (fk → capabilities.id, nullable)
-- `provider_id` (fk → ai_providers.id)
-- `request_hash` (text, nullable) — for dedupe/caching
-- `status` (enum: `queued|completed|failed`)
-- `latency_ms` (int, nullable)
-- `cost_estimate_usd` (numeric, nullable)
-- `created_at`
-
----
-
-### `offload_opportunities` (planned capability)
-Stores “take this off my plate” suggestions.
-- `id` (pk)
-- `user_id` (fk → users.id, indexed)
-- `type` (enum: `delegate|automate|buy|simplify|eliminate`)
-- `status` (enum: `proposed|researching|approved|piloting|adopted|rejected`)
-- `title`
-- `summary` (text)
-- `estimated_time_saved_minutes_per_month` (int, nullable)
-- `estimated_cost_usd_per_month` (numeric, nullable)
-- `roi_score` (numeric, nullable)
+- `days` (text[])  
+  - tokens: `M,Tu,W,Th,F,Sa,Su`
+- `time_start_local` (time)
+- `time_end_local` (time)
+- `task_categories` (text[])  
+  - V1 tokens: `work`, `personal`, `no_work`
+  - (future: `admin`, `deep_work`, `errands`, etc.)
 - `created_at`, `updated_at`
 
-### `offload_opportunity_tasks` (join)
-- `id` (pk)
-- `user_id` (fk → users.id)
-- `opportunity_id` (fk → offload_opportunities.id)
-- `task_id` (fk → tasks.id)
+**Constraints**
+- `time_end_local` > `time_start_local` (no overnight blocks in V1; can be extended later)
+
+**Usage**
+Planner uses these blocks as default scheduling boundaries:
+- Schedule tasks whose TaskSpec.category matches block categories
+- If `allow_scheduling_outside_of_category=true`, allow short exceptions (configurable heuristic)
 
 ---
 
-## 2) Telemetry / work logs
+## 6) Telemetry / work logs
 
 ### `task_work_logs`
 Captures actual work sessions (even outside planned blocks).
@@ -290,7 +286,7 @@ Captures actual work sessions (even outside planned blocks).
 
 ---
 
-## 3) Append-only event log
+## 7) Append-only event log
 
 ### `events`
 Immutable fact record (insert-only).
@@ -309,42 +305,9 @@ Immutable fact record (insert-only).
 
 ---
 
-## 4) Relationship summary (high level)
-
-- **User**
-  - has many Projects, Tasks, Plans, Notes, Events, WorkLogs, OffloadOpportunities
-  - has one Preferences
-
-- **Project**
-  - has many Tasks
-  - has many Notes (optional)
-
-- **Task**
-  - belongs to User; optionally belongs to Project
-  - has many Dependencies (as blocked or prerequisite)
-  - appears in many Plans via PlanItems
-  - appears in many Blocks via BlockTasks (optional)
-  - has many WorkLogs
-
-- **Plan**
-  - belongs to User
-  - has many PlanBlocks
-  - has many PlanItems
-
-- **PlanBlock**
-  - belongs to Plan
-  - may reference Tasks via BlockTasks
-  - may have WorkLogs
-
----
-
-## 5) V1 “minimum viable” subset
-If you want to keep schema small at first, V1 can start with:
-- users, projects, tasks
-- plans, plan_blocks, plan_items
-- preferences
-- task_work_logs
-- events
-- (notes optional, but recommended)
-
-AI routing tables can exist with minimal rows (single default) and grow later.
+## 8) Relationship summary (high level)
+- **Project** has many **TaskSpecs**
+- **TaskSpec** has at most one active **Task**
+- **PlanItems** reference **Tasks** (instances)
+- Dependencies are between **TaskSpecs**, and only for matching recurrence specs
+- **PreferredWorkingBlocks** guide planner scheduling by category
